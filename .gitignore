@@ -10,3 +10,7 @@ __pycache__/
 *.pyc
 
 .DS_Store
+
+# private per-project QA sets + bench results
+bench/local/
+bench/results/

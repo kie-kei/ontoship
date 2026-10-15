@@ -3,10 +3,11 @@ node_type: reference
 title: GitMark ontology — a knowledge model over code
 service: _platform
 status: active
-updated: 2026-06-16
-tags: [ontology, palantir, node-type, links, frontmatter]
+description: "The OntoShip document model: node types, frontmatter properties, typed links, trust and lifecycle fields (OKF-compatible) and the lint invariants I1–I8."
+updated: 2026-10-15
+tags: [ontology, palantir, okf, node-type, links, frontmatter, trust]
 links:
-  relates_to: [services/kb-curate/README.md, services/gitmark-cli/README.md, reference/architecture.md]
+  relates_to: [services/kb-curate/README.md, services/gitmark-cli/README.md, reference/architecture.md, decisions/okf-alignment.md]
 ---
 
 # GitMark ontology — a knowledge model over code
@@ -48,12 +49,17 @@ YAML frontmatter at the top of the file — the "columns" of the object row.
 
 ```yaml
 ---
-node_type: service          # REQUIRED — one of the table above
+node_type: service          # REQUIRED — one of the table above (OKF: `type`)
 title: Billing              # human-readable object name
+description: "Who pays what and when: tariffs, trial, renewals and refunds in the billing service."
 service: billing            # which service; use a sentinel (e.g. _platform) for cross-cutting
 status: active              # active | draft | deprecated | archived
 updated: 2026-06-06          # last meaningful edit (YYYY-MM-DD)
 tags: [payments, api]       # free-form labels for search/grouping
+generated: { by: claude-code/opus-5-5, at: 2026-06-06T10:00:00Z }   # who wrote it (OKF)
+verified:                   # who confirmed it against reality (OKF) — never self-asserted
+  - { by: human:vk, at: 2026-06-07T09:00:00Z }
+stale_after: 2026-12-01T00:00:00Z   # perishable facts: re-check after this instant (OKF)
 links:                      # typed links (see below), optional
   documents: [../../src/billing]
   depends_on: [../reference/architecture.md]
@@ -62,7 +68,23 @@ links:                      # typed links (see below), optional
 ```
 
 Required: `node_type`. Strongly recommended for load-bearing docs
-(`service|reference|runbook|plan|decision`): `title`, `service`, `status`, `updated`.
+(`service|reference|runbook|plan|decision`): `title`, `description`, `service`, `status`,
+`updated`. `description` is not decoration: it is indexed with extra weight, and on our
+benchmark adding it lifted hit@1 from 0.77 to 0.83 (see
+[decisions/okf-alignment.md](decisions/okf-alignment.md)).
+
+### Trust and lifecycle (from OKF)
+
+- **`generated`** `{by, at}` — who/what produced the current content. Actors:
+  `<tool>/<version>` for agents (`claude-code/opus-5-5`), `human:<id>`, `process:<id>`.
+- **`verified`** — list of `{by, at}` confirmations. The **trust tier** is derived, not
+  stored: no `verified` → *unverified*; only machines → *machine*; any `human:` →
+  *human*. An agent never writes a `human:` verification for itself.
+- **`stale_after`** — absolute instant; past it the doc is *stale* (lint I8, demoted and
+  labeled in search).
+
+`gitmark query` answers questions over all of these without a database, e.g.
+`query 'generated.by~claude' trust=unverified type=runbook`.
 
 `service` is a **controlled vocabulary** you define for your project.
 
@@ -98,6 +120,27 @@ DEPRECATE → `status` + `supersedes`. LINK → no orphans. REINDEX → `gitmark
 - **I4.** No broken links (a markdown link to a missing file).
 - **I5.** Every `docs/**` folder has a `README.md` index.
 - **I6.** A `supersedes` target has `status: deprecated|archived`.
+- **I7.** A `documents`/`implemented_by` target (code path) exists.
+- **I8.** `stale_after` has not passed.
+
+Vocabularies are extensible per project in this file's own frontmatter
+(`vocab: {service: […], node_type: […], status: […], link: […]}`); without
+`vocab.service`, the service vocabulary is derived from folder names.
+
+## Relation to the Open Knowledge Format (OKF)
+
+OKF (Google, v0.2) standardizes the same idea — a folder of markdown concepts with YAML
+frontmatter. OntoShip reads OKF bundles as-is and adds what OKF deliberately leaves out:
+
+| | OKF | OntoShip |
+|---|---|---|
+| type key | `type` (free string) | `node_type` (controlled vocab) — `type` accepted |
+| summary | `description` | `description` (same) |
+| trust / lifecycle | `generated`, `verified`, `status`, `stale_after` | same fields; `stable` = `active` |
+| links | untyped, meaning in prose | **typed** (`documents`, `depends_on`, `supersedes`…) incl. doc → code |
+| folder index | `index.md` | `README.md` (`index.md` also accepted) |
+| validation | consumers must tolerate anything | `gitmark lint` invariants I1–I8 |
+| search / query | out of scope | `gitmark search` (FTS5) + `gitmark query` (frontmatter) |
 
 ## Why this, not a wiki/Notion
 

@@ -63,12 +63,14 @@ No layer underneath needs a database, a schema or embeddings.
 
 | command | what |
 |---|---|
-| `index` | build a SQLite **FTS5** index: `bm25` ∪ `trigram` (substring) ∪ fuzzy (4-char windows, typo/morphology/non-Latin tolerant) |
-| `search` | ranked `file:line · heading · snippet`; `--json` for tooling |
+| `index` | build a SQLite **FTS5** index of sections + frontmatter (title, description, tags, type, status, trust) and typed links |
+| `search` | ranked per file: section bm25 + title/description bm25 + trigram substring + fuzzy (typos, Russian morphology), fused with RRF; `--type/--status/--service` filters; `--json` |
+| `query` | structured questions over frontmatter, straight from md: `query type=decision status!=deprecated`, `query type=plan --count-by service`, `query trust=unverified 'generated.by~claude'` |
 | `map` | self-contained **HTML**: collapsible tree + rendered markdown + a force/radial **graph** of links |
 | `serve` | tiny local HTTP server to view the map |
 | `stat` | index/KB stats |
-| `lint` | *(optional)* ontology checks: broken links, frontmatter, folder READMEs |
+| `lint` | *(optional)* ontology checks I1–I8: frontmatter, vocabularies, orphans, broken links, typed links to missing code, past `stale_after` |
+| `health` | KB scorecard: typed %, description %, typed links, orphans, trust tiers, stale, duplicate docs |
 | `version` | — |
 
 OntoShip ships the **`gitmark`** plugin (KB + dev-flow) as a Claude Code marketplace.
@@ -160,6 +162,13 @@ markdown. If a team wants the KB not to rot as it grows, there's a light **code-
 each doc gets a `node_type`, a few frontmatter properties, and typed links — and
 `gitmark lint` enforces it (no broken links, no orphans, every folder has a README index).
 See [`docs/ontology.md`](docs/ontology.md). Use it or ignore it; the tool doesn't force it.
+
+The frontmatter is compatible with Google's [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md):
+`type` works as `node_type`, and `description`, `generated`/`verified` (trust tier) and
+`stale_after` are understood by search, `query` and `lint`. On a 198-question benchmark
+over seven real project KBs, gitmark 0.2 puts the right doc first 69% of the time
+(grep: 30%, 0.1: 47%); adding a one-line `description` to docs lifts it further —
+see [docs/decisions/okf-alignment.md](docs/decisions/okf-alignment.md) and [`bench/`](bench/README.md).
 
 Palantir models an organization as objects, their properties and the links between them.
 OntoShip borrows exactly those three entities and applies them to knowledge about code:
