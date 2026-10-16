@@ -4,44 +4,72 @@
 Source of truth = markdown. Всё производное (поисковый индекс, HTML-обзор, граф)
 регенерится из md → git остаётся чистым (.gitmark/ в .gitignore).
 
-Поиск: SQLite FTS5 — bm25() (ранжировка по терминам) ∪ trigram-токенайзер
-(n-gram: substring, опечатки, кириллица). Чистый python stdlib. Оффлайн.
+Поиск: SQLite FTS5 — несколько каналов (bm25 по чанкам, bm25 по title/description/
+tags, trigram-подстрока, fuzzy 4-граммы), слитые RRF на уровне
+файлов. Frontmatter (тип, статус, trust, stale) — в индексе и в фильтрах.
+Чистый python stdlib (PyYAML — опционально, для полного YAML). Оффлайн.
 
 Команды:
-    gitmark [--root .] index [--force]       построить/обновить индекс
-    gitmark search "<q>" [-k 8] [--json]      искать (bm25 ∪ trigram)
+    gitmark [--root .] index                  построить индекс
+    gitmark search "<q>" [-k 8] [--json] [--type T] [--status S] [--service S]
+                   [--scope all|live|history]
+    gitmark query  [key=val key!=val key~sub key>val key? !key …] [--fields …]
+                   [--count-by key] [--json]  структурный запрос по frontmatter
     gitmark map   [-o docs/docs-map.html]     self-contained HTML: дерево+рендер+граф
     gitmark serve [-p 8799]                   локальный http для просмотра HTML
     gitmark stat                              статистика индекса/БЗ
-    gitmark lint  [paths…] [--strict]         проверить онтологию (типы/связи/README/битые ссылки)
+    gitmark lint  [paths…] [--strict] [--json]  проверить онтологию (I1–I8)
+    gitmark health [--json]                   скоркард БЗ: типизация, связи, trust, stale
     gitmark version
 
-Markdown-рендер в `map` использует lib `markdown` если установлена (опционально),
-иначе показывает raw md. Всё остальное — stdlib.
+Совместимо с Open Knowledge Format (OKF v0.2): `type` = синоним `node_type`,
+`description`, `generated`/`verified` (trust tier), `stale_after`, `status: stable`,
+ссылки от корня (`/path.md`).
 """
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
 
-VERSION = "0.1.0"
+_yaml = False                           # PyYAML грузится лениво (поиску он не нужен)
+
+
+def _load_yaml():
+    """PyYAML, если установлен (полный YAML); иначе None → мини-парсер."""
+    global _yaml
+    if _yaml is False:
+        try:
+            import yaml as _y
+            _yaml = _y
+        except Exception:
+            _yaml = None
+    return _yaml
+
+VERSION = "0.2.0"
 
 EXCLUDE_DIRS = {
     ".git", "node_modules", ".next", "dist", "build", "__pycache__",
     ".pytest_cache", "_vendor", ".venv", "venv", "vendor",
     ".gitmark", ".worktrees",
 }
+IGNORE_FILE = ".gitmarkignore"
 DB_REL = ".gitmark/index.db"
 HEAD_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")
 WORD_RE = re.compile(r"[\w\-]+", re.UNICODE)
+FM_RE = re.compile(r"\A﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 
 
 # ─────────────────────────── discovery ───────────────────────────
@@ -53,11 +81,43 @@ def repo_root(start: Path) -> Path:
     return p
 
 
+def ignored_prefixes(root: Path) -> tuple:
+    """.gitmarkignore в корне: путь на строку (папка или файл от корня), # — комментарий."""
+    f = root / IGNORE_FILE
+    if not f.exists():
+        return ()
+    return tuple(l.strip().strip("/") for l in f.read_text(encoding="utf-8").splitlines()
+                 if l.strip() and not l.lstrip().startswith("#"))
+
+
+def _git_md(root: Path) -> list | None:
+    """*.md, которые видит git (tracked + untracked, без .gitignore). None — не git-репо."""
+    try:
+        r = subprocess.run(["git", "-C", str(root), "ls-files", "-co", "--exclude-standard",
+                            "-z", "--", "*.md"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return [x for x in r.stdout.decode("utf-8", "replace").split("\0") if x]
+
+
 def iter_md(root: Path):
-    for p in sorted(root.rglob("*.md")):
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts):
+    """Markdown базы знаний. В git-репо — то, что видит git (вендорные/игнорируемые
+    папки отпадают сами), иначе обход ФС. Плюс EXCLUDE_DIRS и .gitmarkignore."""
+    skip = ignored_prefixes(root)
+    rels = _git_md(root)
+    if rels is None or os.environ.get("GITMARK_NO_GIT"):
+        rels = [p.relative_to(root).as_posix() for p in root.rglob("*.md")]
+    for rel in sorted(set(rels)):
+        parts = rel.split("/")
+        if any(part in EXCLUDE_DIRS for part in parts[:-1]):
             continue
-        yield p
+        if any(rel == s or rel.startswith(s + "/") for s in skip):
+            continue
+        p = root / rel
+        if p.is_file():
+            yield p
 
 
 def area_of(rel: str) -> str:
@@ -81,19 +141,22 @@ def title_of(text: str, rel: str) -> str:
     return Path(rel).name
 
 
-def chunk_md(text: str):
-    """Чанкуем по заголовкам → (line_start, heading, body)."""
+def chunk_md(text: str, line_offset: int = 0):
+    """Чанкуем по заголовкам → (line_start, heading, body). line_offset — строки frontmatter."""
     lines = text.split("\n")
-    chunks, cur = [], {"line": 1, "heading": "", "body": []}
-    for i, ln in enumerate(lines, 1):
-        m = HEAD_RE.match(ln)
+    chunks, cur = [], {"line": 1 + line_offset, "heading": "", "body": []}
+    in_fence = False
+    for i, ln in enumerate(lines, 1 + line_offset):
+        if ln.lstrip().startswith("```"):
+            in_fence = not in_fence
+        m = None if in_fence else HEAD_RE.match(ln)
         if m:
             if cur["body"] or cur["heading"]:
                 chunks.append((cur["line"], cur["heading"], "\n".join(cur["body"])))
             cur = {"line": i, "heading": m.group(2).strip(), "body": [ln]}
         else:
             cur["body"].append(ln)
-    if cur["body"] or cur["heading"]:
+    if any(x.strip() for x in cur["body"]) or cur["heading"]:
         chunks.append((cur["line"], cur["heading"], "\n".join(cur["body"])))
     return chunks
 
@@ -103,27 +166,302 @@ def _nfc(s: str) -> str:
 
 
 def resolve_link(src_rel: str, href: str, known: set) -> str | None:
-    href = _nfc(href.split("#")[0].strip())
+    """md-ссылка → путь известного дока. `/x.md` — от корня (OKF), иначе от папки src."""
+    import posixpath
+    href = _nfc(href.split("#")[0].strip().strip("<>"))
     if not href or not href.endswith(".md") or href.startswith(("http", "mailto:")):
         return None
-    known = {_nfc(k) for k in known}
     src_dir = Path(_nfc(src_rel)).parent
-    cands = []
-    try:
-        cands.append((src_dir / href).as_posix())
-    except Exception:
-        pass
-    cands.append(href.lstrip("./"))
-    # нормализуем ../ через PurePosix
-    import posixpath
-    norm = posixpath.normpath((src_dir / href).as_posix())
-    cands.append(norm)
+    if href.startswith("/"):
+        cands = [href.lstrip("/")]
+    else:
+        cands = [posixpath.normpath((src_dir / href).as_posix()), href.lstrip("./")]
     for c in cands:
         if c in known:
             return c
     base = Path(href).name
     hits = [r for r in known if r.endswith("/" + base) or r == base]
     return hits[0] if len(hits) == 1 else None
+
+
+# ─────────────────────────── frontmatter ───────────────────────────
+def split_frontmatter(text: str):
+    """→ (yaml-текст | None, тело, число строк, занятых frontmatter)."""
+    m = FM_RE.match(text)
+    if not m:
+        return None, text.lstrip("﻿"), 0
+    return m.group(1), text[m.end():], m.group(0).count("\n")
+
+
+def _plain(v):
+    """PyYAML-значения → JSON-совместимые (даты → ISO-строки)."""
+    if isinstance(v, dict):
+        return {str(k): _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    if isinstance(v, (_dt.date, _dt.datetime)):
+        return v.isoformat().replace("+00:00", "Z")
+    return v
+
+
+def _strip_comment(line: str) -> str:
+    """Убрать YAML-комментарий ` # …` вне кавычек."""
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "'\"":
+            q = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i]
+    return line
+
+
+def _split_top(s: str) -> list:
+    """Разбить по запятым верхнего уровня (не внутри [] {} и кавычек)."""
+    out, depth, q, cur = [], 0, None, ""
+    for ch in s:
+        if q:
+            q = None if ch == q else q
+        elif ch in "'\"":
+            q = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip():
+        out.append(cur)
+    return [x.strip() for x in out]
+
+
+_KV_RE = re.compile(r"^([^\s'\"\[{#-][^:]*?|\"[^\"]*\"|'[^']*'):(?:\s+(.*)|\s*)$")
+
+
+def _scalar(v: str):
+    v = v.strip()
+    if not v:
+        return None
+    if v[0] == "[" and v[-1] == "]":
+        return [_scalar(x) for x in _split_top(v[1:-1])]
+    if v[0] == "{" and v[-1] == "}":
+        d = {}
+        for part in _split_top(v[1:-1]):
+            m = _KV_RE.match(part)
+            if m:
+                d[m.group(1).strip("'\"")] = _scalar(m.group(2) or "")
+        return d
+    if len(v) > 1 and v[0] == v[-1] and v[0] in "'\"":
+        return v[1:-1]
+    low = v.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    return v
+
+
+def _mini_yaml(raw: str) -> dict:
+    """Мини-парсер YAML (stdlib): скаляры, flow [..]/{..}, вложенные map/list по отступам,
+    блочные скаляры | и >, комментарии. Покрывает то, что реально пишут во frontmatter."""
+    root: dict = {}
+    stack = [(-1, root)]          # (мин. отступ элементов, контейнер)
+    pending = None                # (отступ, dict, ключ) — ключ без значения ждёт блок
+    block = None                  # (отступ ключа, dict, ключ, style, [строки]) — | или >
+    for line in raw.split("\n"):
+        if block:
+            ind = len(line) - len(line.lstrip(" \t"))
+            if not line.strip() or ind > block[0]:
+                block[4].append(line.strip())
+                continue
+            sep = "\n" if block[3] == "|" else " "
+            block[1][block[2]] = sep.join(block[4]).strip()
+            block = None
+        line = _strip_comment(line).rstrip()
+        if not line.strip():
+            continue
+        ind = len(line) - len(line.lstrip(" \t"))
+        s = line.strip()
+        is_item = s == "-" or s.startswith("- ")
+        if pending:
+            pind, pd, pkey = pending
+            pending = None
+            if ind > pind or (is_item and ind == pind):
+                cont = [] if is_item else {}
+                pd[pkey] = cont
+                stack.append((ind, cont))
+        while len(stack) > 1:
+            mind, cont = stack[-1]
+            if ind < mind or (ind == mind and isinstance(cont, list) != is_item):
+                stack.pop()
+            else:
+                break
+        cont = stack[-1][1]
+        if is_item and isinstance(cont, list):
+            val = s[1:].strip()
+            m = _KV_RE.match(val) if val and val[0] not in "[{'\"" else None
+            if m:                                     # "- key: v" — map внутри списка
+                d = {}
+                cont.append(d)
+                stack.append((ind + 2, d))
+                k, v = m.group(1).strip("'\""), m.group(2) or ""
+                d[k] = _scalar(v) if v else None
+                if not v:
+                    pending = (ind + 2, d, k)
+            else:
+                cont.append(_scalar(val))
+            continue
+        if not isinstance(cont, dict):
+            continue
+        m = _KV_RE.match(s)
+        if not m:
+            continue
+        k, v = m.group(1).strip("'\""), (m.group(2) or "").strip()
+        if v in ("|", ">", "|-", ">-", "|+", ">+"):
+            block = (ind, cont, k, v[0], [])
+            cont[k] = ""
+        elif not v:
+            cont[k] = None
+            pending = (ind, cont, k)
+        else:
+            cont[k] = _scalar(v)
+    if block:
+        block[1][block[2]] = ("\n" if block[3] == "|" else " ").join(block[4]).strip()
+    return root
+
+
+def parse_frontmatter(text: str) -> dict | None:
+    """YAML-frontmatter → dict (None — нет frontmatter). PyYAML если есть, иначе мини-парсер;
+    мини-парсер же — фолбэк на «почти-YAML», который PyYAML не принимает (`title: a: b`)."""
+    raw, _, _ = split_frontmatter(text)
+    if raw is None:
+        return None
+    y = _load_yaml()
+    if y is not None:
+        try:
+            data = y.safe_load(raw)
+            if isinstance(data, dict):
+                return _plain(data)
+        except Exception:
+            pass
+    return _mini_yaml(raw)
+
+
+def as_list(v) -> list:
+    if v is None or v == "":
+        return []
+    if isinstance(v, list):
+        return [x for x in v if x is not None and x != ""]
+    return [v]
+
+
+def trust_tier(fm: dict) -> str:
+    """OKF §5.3: нет verified → unverified; только машины → machine; есть human: → human."""
+    ver = (fm or {}).get("verified")
+    if not ver:
+        return "unverified"
+    evs = ver if isinstance(ver, list) else [ver]
+    bys = [str(e.get("by", "")) if isinstance(e, dict) else str(e) for e in evs]
+    return "human" if any(b.startswith("human:") for b in bys) else "machine"
+
+
+def _parse_when(v) -> _dt.datetime | None:
+    if not v:
+        return None
+    s = str(v).strip().replace("Z", "+00:00")
+    try:
+        d = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            d = _dt.datetime.fromisoformat(s[:10])
+        except ValueError:
+            return None
+    return d if d.tzinfo else d.replace(tzinfo=_dt.timezone.utc)
+
+
+def is_stale(fm: dict, now: _dt.datetime | None = None) -> bool:
+    """OKF §5.5: stale, когда now >= stale_after."""
+    when = _parse_when((fm or {}).get("stale_after"))
+    return bool(when and (now or _dt.datetime.now(_dt.timezone.utc)) >= when)
+
+
+def node_type_of(fm: dict | None) -> str | None:
+    """`node_type` (OntoShip) или `type` (OKF)."""
+    fm = fm or {}
+    nt = fm.get("node_type") or fm.get("type")
+    return str(nt).strip() if nt else None
+
+
+def fm_links(fm: dict | None) -> list:
+    """Типизированные связи из `links:` → [(link_type, target), …]."""
+    links = (fm or {}).get("links")
+    if not isinstance(links, dict):
+        return []
+    return [(str(lt), str(t).strip()) for lt, ts in links.items()
+            for t in as_list(ts) if str(t).strip()]
+
+
+def load_doc(root: Path, p: Path) -> dict | None:
+    """Прочитать md → {rel, text, body, offset, fm, meta}. None — не читается."""
+    rel = p.relative_to(root).as_posix()
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+    except OSError:
+        return None
+    _, body, offset = split_frontmatter(text)
+    fm = parse_frontmatter(text) or {}
+    gen = fm.get("generated") if isinstance(fm.get("generated"), dict) else {}
+    meta = {
+        "node_type": node_type_of(fm) or "",
+        "title": str(fm.get("title") or title_of(body, rel)),
+        "description": str(fm.get("description") or ""),
+        "tags": [str(x) for x in as_list(fm.get("tags"))],
+        "aliases": [str(x) for x in as_list(fm.get("aliases"))],
+        "status": str(fm.get("status") or ""),
+        "service": [x.strip() for v in as_list(fm.get("service")) for x in str(v).split(",") if x.strip()],
+        "updated": str(fm.get("updated") or gen.get("at") or ""),   # OKF: generated.at
+        "trust": trust_tier(fm),
+        "stale": is_stale(fm),
+    }
+    return {"rel": rel, "text": text, "body": body, "offset": offset,
+            "fm": fm if text.startswith(("---", "﻿---")) else None, "meta": meta}
+
+
+def load_docs(root: Path) -> dict:
+    out = {}
+    for p in iter_md(root):
+        d = load_doc(root, p)
+        if d:
+            out[_nfc(d["rel"])] = d
+    return out
+
+
+def doc_edges(d: dict, known: set) -> list:
+    """Все связи дока: (dst, link_type, kind). kind: doc|code|url|missing."""
+    rel, out, seen = d["rel"], [], set()
+    for lt, t in fm_links(d["fm"]):
+        dst = resolve_link(rel, t, known)
+        if dst:
+            kind = "doc"
+        elif t.startswith(("http://", "https://")):
+            dst, kind = t, "url"
+        else:
+            dst, kind = t, "code"
+        if (dst, lt) not in seen:
+            seen.add((dst, lt))
+            out.append((dst, lt, kind))
+    for href in LINK_RE.findall(strip_code(d["body"])):
+        dst = resolve_link(rel, href.split()[0] if href.split() else href, known)
+        if dst and dst != rel and not any(o[0] == dst for o in out):
+            out.append((dst, "relates_to", "doc"))
+    return out
 
 
 # ─────────────────────────── index ───────────────────────────
@@ -137,71 +475,109 @@ def _has_trigram(con) -> bool:
 
 
 def cmd_index(root: Path, force: bool = False) -> dict:
+    """Индекс — кэш: всегда пересобирается целиком (быстро; схема меняется между версиями)."""
     db = root / DB_REL
     db.parent.mkdir(parents=True, exist_ok=True)
+    if db.exists():
+        db.unlink()
     con = sqlite3.connect(db)
+    tok = "tokenize='unicode61 remove_diacritics 2'"
     try:
-        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts USING "
-                    "fts5(path UNINDEXED, heading, lineno UNINDEXED, body, "
-                    "tokenize='unicode61 remove_diacritics 2')")
+        con.execute(f"CREATE VIRTUAL TABLE fts USING fts5(path UNINDEXED, lineno UNINDEXED, heading, body, {tok})")
+        con.execute(f"CREATE VIRTUAL TABLE dfts USING fts5(path UNINDEXED, title, meta, {tok})")
     except sqlite3.OperationalError as e:
         print(f"ОШИБКА: SQLite без FTS5 ({e}). Нужен python с FTS5.", file=sys.stderr)
         sys.exit(2)
     has_tri = _has_trigram(con)
     if has_tri:
-        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS tri USING "
-                    "fts5(path UNINDEXED, heading, lineno UNINDEXED, body, tokenize='trigram')")
-    con.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, title TEXT, "
-                "area TEXT, size INT, chunks INT)")
-    con.execute("CREATE TABLE IF NOT EXISTS links(src TEXT, dst TEXT)")
-    con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
-    for t in ("fts", "files", "links"):
-        con.execute(f"DELETE FROM {t}")
-    if has_tri:
-        con.execute("DELETE FROM tri")
+        con.execute("CREATE VIRTUAL TABLE tri USING fts5(path UNINDEXED, lineno UNINDEXED, body, tokenize='trigram')")
+    con.execute("CREATE TABLE files(path TEXT PRIMARY KEY, title TEXT, area TEXT, size INT, chunks INT, "
+                "node_type TEXT, status TEXT, service TEXT, description TEXT, updated TEXT, "
+                "trust TEXT, stale INT, fm TEXT)")
+    con.execute("CREATE TABLE links(src TEXT, dst TEXT, type TEXT, kind TEXT)")
+    con.execute("CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)")
 
-    files = {}
-    for p in iter_md(root):
-        rel = p.relative_to(root).as_posix()
-        try:
-            text = p.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        files[rel] = text
-    known = set(files)
-
+    docs = load_docs(root)
+    known = set(docs)
     nchunks = 0
-    for rel, text in files.items():
-        title, area = title_of(text, rel), area_of(rel)
-        chs = chunk_md(text)
+    for rel, d in docs.items():
+        m = d["meta"]
+        chs = chunk_md(d["body"], d["offset"])
         for line, heading, body in chs:
-            con.execute("INSERT INTO fts(path,heading,lineno,body) VALUES(?,?,?,?)",
-                        (rel, heading, str(line), body))
+            con.execute("INSERT INTO fts VALUES(?,?,?,?)", (rel, str(line), heading, body))
             if has_tri:
-                con.execute("INSERT INTO tri(path,heading,lineno,body) VALUES(?,?,?,?)",
-                            (rel, heading, str(line), body))
+                con.execute("INSERT INTO tri VALUES(?,?,?)", (rel, str(line), heading + "\n" + body))
         nchunks += len(chs)
-        con.execute("INSERT INTO files VALUES(?,?,?,?,?)",
-                    (rel, title, area, len(text.encode("utf-8")), len(chs)))
-        seen = set()
-        for m in LINK_RE.finditer(text):
-            dst = resolve_link(rel, m.group(1).split()[0], known)
-            if dst and dst != rel and (rel, dst) not in seen:
-                seen.add((rel, dst))
-                con.execute("INSERT INTO links VALUES(?,?)", (rel, dst))
+        path_words = " ".join(re.split(r"[/_.\-]+", rel.rsplit(".", 1)[0]))
+        con.execute("INSERT INTO dfts VALUES(?,?,?)", (
+            rel, m["title"],
+            " ".join([m["description"], " ".join(m["tags"]), " ".join(m["aliases"]), path_words])))
+        con.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            rel, m["title"], area_of(rel), len(d["text"].encode("utf-8")), len(chs),
+            m["node_type"], m["status"], ",".join(m["service"]), m["description"], m["updated"],
+            m["trust"], int(m["stale"]), json.dumps(d["fm"], ensure_ascii=False, default=str)))
+        for dst, lt, kind in doc_edges(d, known):
+            con.execute("INSERT INTO links VALUES(?,?,?,?)", (rel, dst, lt, kind))
     con.execute("INSERT OR REPLACE INTO meta VALUES('trigram', ?)", ("1" if has_tri else "0",))
     con.execute("INSERT OR REPLACE INTO meta VALUES('version', ?)", (VERSION,))
     con.commit()
-    n_links = con.execute("SELECT count(*) FROM links").fetchone()[0]
+    n_links = con.execute("SELECT count(*) FROM links WHERE kind='doc'").fetchone()[0]
     con.close()
-    return {"files": len(files), "chunks": nchunks, "links": n_links,
+    return {"files": len(docs), "chunks": nchunks, "links": n_links,
             "trigram": has_tri, "db": str(db.relative_to(root))}
 
 
 # ─────────────────────────── search ───────────────────────────
+STOPWORDS = set("""
+и в во не что он на я с со как а то все она так его но да ты к у же вы за бы по только ее её мне
+было вот от меня еще ещё нет о об из ему теперь когда ли если уже или ни быть был него до вас
+опять уж вам ведь там потом себя ничего ей может они тут где есть надо ней для мы тебя их чем
+была сам чтоб без чего раз тоже себе под будет ж тогда кто этот того потому этого какой какая
+какие каким каких какую здесь этом один мой тем чтобы нее сейчас были куда зачем всех можно при
+после над больше тот через эти нас про всего них много три эту эта это моя свою этой перед лучше
+том нельзя такой им более всегда между почему нужно надо сколько чтобы ли как-то который которая
+которые если именно сделать делать
+a an the and or but if of to in on at by for with from as is are was were be been being do does
+did how what where which who whom why when can could should would will shall may might must i we
+you he she it they our your my me us this that these those there here into about than then so not
+no have has had get got its it's any some all each just also
+""".split())
+
+_RU_END = sorted("""ями ами иями ией иях ях ах ов ев ей ий ый ой ая яя ое ее ые ие ых их ого его
+ому ему ыми ими ом ем ам ям ую юю ть ться ется ются ет ют ит ят ил ила ило или ешь ишь ете ите ся
+ость ости остью ения ение ений ением ениям ированный ировать ирование ующий ующая ующие а я о е ы
+и у ю ь й""".split(), key=len, reverse=True)
+_EN_END = sorted("ations ation ings ing ments ment ness ies ied ers er es ed ly s".split(),
+                 key=len, reverse=True)
+_CYR = re.compile(r"[а-яё]")
+
+
+def stem(w: str) -> str:
+    """Лёгкий стеммер ru/en: срезать одно окончание, оставив основу ≥4 символов.
+    Запрос ищется префиксом основы — «деплоймента» найдёт «деплоймент», «деплойменты»."""
+    if len(w) <= 4:
+        return w
+    for e in (_RU_END if _CYR.search(w) else _EN_END):
+        if w.endswith(e) and len(w) - len(e) >= 4:
+            return w[:-len(e)]
+    return w
+
+
+def query_terms(query: str) -> list:
+    """Значимые термины запроса (lower, без стоп-слов; если всё стоп-слова — оставить всё)."""
+    words = [w.lower().strip("-") for w in WORD_RE.findall(query)]
+    words = [w for w in words if len(w) >= 2]
+    sig = [w for w in words if w not in STOPWORDS]
+    out, seen = [], set()
+    for w in sig or words:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
 def _fts_match_query(query: str) -> str:
-    terms = [t for t in WORD_RE.findall(query) if len(t) >= 2]
-    return " OR ".join(f'"{t}"*' for t in terms)
+    return " OR ".join(f'"{stem(t)}"*' for t in query_terms(query))
 
 
 def _fuzzy_phrases(s: str) -> list:
@@ -212,7 +588,7 @@ def _fuzzy_phrases(s: str) -> list:
     а случайная строка делит с доками лишь разрозненные частые 3-граммы (`ent`,`non`).
     """
     wins, seen = [], set()
-    for w in WORD_RE.findall(s.lower()):
+    for w in query_terms(s):
         if len(w) < 4:
             continue
         for i in range(len(w) - 3):
@@ -224,72 +600,217 @@ def _fuzzy_phrases(s: str) -> list:
     return wins
 
 
-def cmd_search(root: Path, query: str, k: int = 8) -> list:
+# Веса каналов в RRF и константа сглаживания. Подобраны на bench/ (см. bench/README.md).
+CHANNEL_W = {"chunk": 1.0, "doc": 0.5, "phrase": 0.6, "fuzzy": 0.5}
+RRF_K = 5
+PRIOR = {"typed": 1.3, "index": 0.7, "retired": 0.6, "stale": 0.85}
+HUB_NAMES = {"changelog.md", "log.md", "history.md"}
+# Исторические типы — датированные снимки (замысел до реализации, разовый аудит), которые
+# расходятся с фактом. `--scope live` их прячет, `--scope history` ищет только по ним.
+HISTORICAL_TYPES = {"plan", "report"}     # хроники упоминают всё подряд
+if os.environ.get("GITMARK_TUNE"):                        # для bench/: подбор весов без правки кода
+    _t = json.loads(os.environ["GITMARK_TUNE"])
+    CHANNEL_W.update(_t.get("CHANNEL_W", {}))
+    PRIOR.update(_t.get("PRIOR", {}))
+    RRF_K = _t.get("RRF_K", RRF_K)
+
+
+def _allowed(con, types=None, statuses=None, services=None, scope="all") -> set | None:
+    if not (types or statuses or services) and scope == "all":
+        return None
+    ok = set()
+    for path, nt, st, svc in con.execute("SELECT path,node_type,status,service FROM files"):
+        if types and nt not in types:
+            continue
+        if scope == "live" and nt in HISTORICAL_TYPES or scope == "history" and nt not in HISTORICAL_TYPES:
+            continue
+        if statuses and st not in statuses:
+            continue
+        if services and not set(svc.split(",")) & set(services):
+            continue
+        ok.add(path)
+    return ok
+
+
+def cmd_search(root: Path, query: str, k: int = 8, types=None, statuses=None,
+               services=None, scope: str = "all") -> list:
+    """Поиск: каналы → ранги файлов → RRF → приоры (типизирован / index / deprecated / stale).
+    Один результат на файл — лучший чанк (path:line + сниппет)."""
     db = root / DB_REL
     if not db.exists():
         raise SystemExit("Индекс не найден — запусти `gitmark index`")
     con = sqlite3.connect(db)
+    try:
+        con.execute("SELECT trust FROM files LIMIT 1")
+    except sqlite3.OperationalError:
+        raise SystemExit("Индекс старой версии — запусти `gitmark index`")
     has_tri = (con.execute("SELECT v FROM meta WHERE k='trigram'").fetchone() or ("0",))[0] == "1"
-    results: dict = {}
+    allowed = _allowed(con, types, statuses, services, scope)
+    ranks: dict = defaultdict(dict)        # channel → {path: rank}
+    best: dict = {}                        # path → лучший чанк {line, heading, snippet}
+    N = max(60, k * 8)
+
+    def take(channel, rows, with_chunk=True):
+        r = 0
+        for row in rows:
+            path = row[0]
+            if allowed is not None and path not in allowed:
+                continue
+            if path in ranks[channel]:
+                continue
+            r += 1
+            ranks[channel][path] = r
+            if with_chunk and path not in best:
+                best[path] = {"line": int(row[1]), "heading": row[2], "snippet": " ".join(row[3].split())}
+
     bm_q = _fts_match_query(query)
     if bm_q:
-        try:
-            for path, heading, lineno, snip, score in con.execute(
-                "SELECT path,heading,lineno,"
-                "snippet(fts,3,'»','«','…',14), bm25(fts) "
-                "FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?",
-                (bm_q, k * 3),
-            ):
-                key = (path, lineno)
-                results[key] = {"path": path, "heading": heading, "line": int(lineno),
-                                "snippet": " ".join(snip.split()), "score": -float(score), "via": "bm25"}
+        try:   # (1) bm25 по чанкам; заголовок весит больше тела
+            take("chunk", con.execute(
+                "SELECT path,lineno,heading,snippet(fts,3,'»','«','…',14) FROM fts "
+                "WHERE fts MATCH ? ORDER BY bm25(fts,0,0,2.0,1.0) LIMIT ?", (bm_q, N)))
+        except sqlite3.OperationalError:
+            pass
+        try:   # (2) bm25 по документу: title, description/tags/aliases/путь
+            take("doc", con.execute(
+                "SELECT path FROM dfts WHERE dfts MATCH ? ORDER BY bm25(dfts,0,3.0,1.5) LIMIT ?",
+                (bm_q, N)), with_chunk=False)
         except sqlite3.OperationalError:
             pass
     if has_tri and len(query.strip()) >= 3:
-        # (a) фразовый trigram — точная подстрока (вес 0.6)
-        try:
+        try:   # (3) точная подстрока
             tq = '"' + query.replace('"', " ").strip() + '"'
-            for path, heading, lineno, snip, score in con.execute(
-                "SELECT path,heading,lineno,"
-                "snippet(tri,3,'»','«','…',14), bm25(tri) "
-                "FROM tri WHERE tri MATCH ? ORDER BY bm25(tri) LIMIT ?",
-                (tq, k * 2),
-            ):
-                key = (path, lineno)
-                if key not in results:
-                    results[key] = {"path": path, "heading": heading, "line": int(lineno),
-                                    "snippet": " ".join(snip.split()), "score": -float(score) * 0.6,
-                                    "via": "trigram"}
+            take("phrase", con.execute(
+                "SELECT path,lineno,'',snippet(tri,2,'»','«','…',14) FROM tri "
+                "WHERE tri MATCH ? ORDER BY bm25(tri) LIMIT ?", (tq, N)))
         except sqlite3.OperationalError:
             pass
-        # (b) fuzzy: OR по 4-символьным окнам запроса → опечатки/морфология/кириллица.
-        # Порог покрытия: чанк принимается, только если содержит ≥50% (и ≥2) различных
-        # 4-грамм запроса — отсекает мусор, цепляющий 1 случайное частое окно (вес 0.3).
+        # (4) fuzzy: OR по 4-символьным окнам → опечатки/морфология/кириллица.
+        # Порог покрытия: чанк принимается, только если содержит ≥ ceil(20%) окон запроса.
         grams = _fuzzy_phrases(query)
         if grams:
+            need = max(1, (len(grams) + 4) // 5)
             fq = " OR ".join(f'"{g}"' for g in grams)
-            need = max(1, (len(grams) + 4) // 5)   # ≥ceil(20% окон): коротким хватает 1
-                                                   # (серединная опечатка), длинным — больше
             try:
-                for path, heading, lineno, snip, body, score in con.execute(
-                    "SELECT path,heading,lineno,"
-                    "snippet(tri,3,'»','«','…',14), body, bm25(tri) "
-                    "FROM tri WHERE tri MATCH ? ORDER BY bm25(tri) LIMIT ?",
-                    (fq, k * 3),
-                ):
-                    key = (path, lineno)
-                    if key in results:
-                        continue
+                rows = []
+                for path, lineno, snip, body in con.execute(
+                        "SELECT path,lineno,snippet(tri,2,'»','«','…',14),body FROM tri "
+                        "WHERE tri MATCH ? ORDER BY bm25(tri) LIMIT ?", (fq, N * 2)):
                     bl = body.lower()
-                    if sum(1 for g in grams if g in bl) < need:
-                        continue
-                    results[key] = {"path": path, "heading": heading, "line": int(lineno),
-                                    "snippet": " ".join(snip.split()), "score": -float(score) * 0.3,
-                                    "via": "fuzzy"}
+                    if sum(1 for g in grams if g in bl) >= need:
+                        rows.append((path, lineno, "", snip))
+                take("fuzzy", rows)
             except sqlite3.OperationalError:
                 pass
+
+    fused: dict = defaultdict(float)
+    via: dict = defaultdict(list)
+    for ch, rk in ranks.items():
+        for path, r in rk.items():
+            fused[path] += CHANNEL_W[ch] / (RRF_K + r)
+            via[path].append(ch)
+    if not fused:
+        con.close()
+        return []
+    info = {r[0]: r[1:] for r in con.execute(
+        "SELECT path,title,node_type,status,trust,stale FROM files WHERE path IN (%s)"
+        % ",".join("?" * len(fused)), tuple(fused))}
+    for path in fused:
+        title, nt, st, trust, stale = info.get(path, ("", "", "", "", 0))
+        f = PRIOR["typed"] if nt else 1.0
+        if nt == "index" or Path(path).name.lower() in HUB_NAMES:
+            f *= PRIOR["index"]
+        if st in ("deprecated", "archived", "superseded"):
+            f *= PRIOR["retired"]
+        if stale:
+            f *= PRIOR["stale"]
+        fused[path] *= f
+    top = sorted(fused, key=lambda p: -fused[p])[:k]
+    out = []
+    for path in top:
+        title, nt, st, trust, stale = info.get(path, ("", "", "", "", 0))
+        b = best.get(path)
+        if b is None:                       # файл найден только по doc-каналу — берём первый чанк
+            row = con.execute("SELECT lineno,heading,substr(body,1,240) FROM fts WHERE path=? "
+                              "ORDER BY CAST(lineno AS INT) LIMIT 1", (path,)).fetchone() or (1, "", "")
+            b = {"line": int(row[0]), "heading": row[1], "snippet": " ".join(row[2].split())}
+        out.append({"path": path, "line": b["line"], "heading": b["heading"],
+                    "snippet": b["snippet"], "score": round(fused[path], 5),
+                    "via": "+".join(via[path]), "title": title, "node_type": nt,
+                    "status": st, "trust": trust, "stale": bool(stale)})
     con.close()
-    return sorted(results.values(), key=lambda r: -r["score"])[:k]
+    return out
+
+
+# ─────────────────────────── query (структурные вопросы к frontmatter) ───────────────────────────
+_COND_RE = re.compile(r"^(!)?([\w.\-]+)(?:(!=|>=|<=|=|~|>|<)(.*)|(\?))?$")
+
+
+def _get_path(fm: dict, key: str) -> list:
+    """`a.b` по frontmatter → плоский список значений (сквозь списки)."""
+    vals = [fm]
+    for part in key.split("."):
+        nxt = []
+        for v in vals:
+            if isinstance(v, list):
+                v_items = v
+            else:
+                v_items = [v]
+            for it in v_items:
+                if isinstance(it, dict) and part in it:
+                    x = it[part]
+                    nxt.extend(x if isinstance(x, list) else [x])
+        vals = nxt
+    return [v for v in vals if v is not None and v != ""]
+
+
+def doc_record(d: dict) -> dict:
+    """frontmatter + вычисляемые поля: path, area, type, trust, stale, links.<type>."""
+    rec = dict(d["fm"] or {})
+    m = d["meta"]
+    rec.update({"path": d["rel"], "area": area_of(d["rel"]), "type": m["node_type"],
+                "node_type": m["node_type"], "title": m["title"], "trust": m["trust"],
+                "stale": m["stale"]})
+    return rec
+
+
+def match_cond(rec: dict, cond: str) -> bool:
+    m = _COND_RE.match(cond.strip())
+    if not m:
+        raise SystemExit(f"не понял условие: {cond!r} (ожидаю key=val, key!=val, key~sub, "
+                         f"key>val, key<val, key?, !key)")
+    neg, key, op, val, exists = m.groups()
+    vals = [str(v).lower() if not isinstance(v, bool) else str(v).lower()
+            for v in _get_path(rec, key)]
+    if neg and not op:
+        return not vals
+    if exists or not op:
+        return bool(vals)
+    val = (val or "").strip().strip("'\"").lower()
+    alts = [x.strip() for x in val.split("|")]
+    if op == "=":
+        return any(v in alts for v in vals)
+    if op == "!=":
+        return not any(v in alts for v in vals)
+    if op == "~":
+        return any(a in v for v in vals for a in alts)
+    cmp = {">": lambda a, b: a > b, "<": lambda a, b: a < b,
+           ">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b}[op]
+    return any(cmp(v, val) for v in vals)
+
+
+def cmd_query(root: Path, conds: list, count_by: str | None = None) -> dict:
+    """Фильтр по frontmatter прямо из md (источник истины), без индекса."""
+    rows = [doc_record(d) for d in load_docs(root).values() if d["fm"] is not None]
+    hits = [r for r in rows if all(match_cond(r, c) for c in conds)]
+    res = {"total": len(rows), "matched": len(hits), "rows": hits}
+    if count_by:
+        cnt = Counter()
+        for r in hits:
+            for v in _get_path(r, count_by) or ["(нет)"]:
+                cnt[str(v)] += 1
+        res["counts"] = cnt.most_common()
+    return res
 
 
 # ─────────────────────────── stat ───────────────────────────
@@ -298,29 +819,48 @@ def cmd_stat(root: Path) -> dict:
     if not db.exists():
         return {"indexed": False}
     con = sqlite3.connect(db)
-    f = con.execute("SELECT count(*), coalesce(sum(size),0), coalesce(sum(chunks),0) FROM files").fetchone()
-    links = con.execute("SELECT count(*) FROM links").fetchone()[0]
-    areas = con.execute("SELECT count(DISTINCT area) FROM files").fetchone()[0]
+    try:
+        f = con.execute("SELECT count(*), coalesce(sum(size),0), coalesce(sum(chunks),0) FROM files").fetchone()
+        links = con.execute("SELECT count(*) FROM links WHERE kind='doc'").fetchone()[0]
+        typed = con.execute("SELECT count(*) FROM links WHERE type!='relates_to'").fetchone()[0]
+        areas = con.execute("SELECT count(DISTINCT area) FROM files").fetchone()[0]
+        types = con.execute("SELECT node_type, count(*) FROM files WHERE node_type!='' "
+                            "GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    except sqlite3.OperationalError:
+        con.close()
+        return {"indexed": False, "stale_schema": True}
     has_tri = (con.execute("SELECT v FROM meta WHERE k='trigram'").fetchone() or ("0",))[0] == "1"
     con.close()
-    return {"indexed": True, "files": f[0], "bytes": f[1], "chunks": f[2],
-            "links": links, "areas": areas, "trigram": has_tri}
+    return {"indexed": True, "files": f[0], "bytes": f[1], "chunks": f[2], "links": links,
+            "typed_links": typed, "areas": areas, "trigram": has_tri, "types": types}
 
 
 # ─────────────────────────── lint (онтология) ───────────────────────────
-# Словари из docs/reference/gitmark-ontology.md (source of truth).
+# Словари по умолчанию. Проект расширяет их в frontmatter своего ontology.md:
+#   vocab: { node_type: [meeting], service: [api, billing], status: [done] }
 NODE_TYPES = {"service", "reference", "runbook", "gotcha", "decision",
               "plan", "guide", "report", "index", "memory"}
-# Реальный словарь сервисов выводится per-repo из имён папок docs/services/*
-# (см. cmd_lint). Здесь — только кросс-срезовый sentinel.
+# Реальный словарь сервисов выводится per-repo из имён папок docs/** + vocab.service.
 SERVICES = {"_platform"}
-STATUSES = {"active", "draft", "deprecated", "archived"}
+STATUSES = {"active", "draft", "deprecated", "archived", "stable"}   # stable — OKF
 LOAD_BEARING = {"service", "reference", "runbook", "plan", "decision"}
+BEARING_DIRS = {"reference", "ops", "plans", "decisions", "services"}
+CODE_DIRS = ("services", "apps", "packages", "libs", "modules")
 LINK_KEYS = {"documents", "depends_on", "supersedes", "relates_to",
              "implemented_by", "part_of"}
-FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
+
+INVARIANTS = {
+    "I1": "несущий документ без frontmatter с node_type/type",
+    "I2": "значение вне словаря (node_type/service/status/тип связи)",
+    "I3": "сирота — нет связей",
+    "I4": "битая md-ссылка",
+    "I5": "папка docs/ без README.md",
+    "I6": "supersedes-цель не deprecated/archived",
+    "I7": "links: documents/implemented_by → путь не существует",
+    "I8": "просрочен stale_after",
+}
 
 
 def strip_code(text: str) -> str:
@@ -328,120 +868,178 @@ def strip_code(text: str) -> str:
     return INLINE_CODE_RE.sub(" ", FENCE_RE.sub(" ", text))
 
 
-def parse_frontmatter(text: str) -> dict | None:
-    """Мини-парсер YAML-frontmatter (stdlib, без pyyaml). Скаляры + плоские списки."""
-    m = FM_RE.match(text)
-    if not m:
-        return None
-    fm, cur_key = {}, None
-    for raw in m.group(1).split("\n"):
-        if not raw.strip() or raw.lstrip().startswith("#"):
+def in_kb(rel: str) -> bool:
+    """Что линтуется: docs/** и md в корне (README/CLAUDE/AGENTS). Прочие md (код, фикстуры) —
+    ищутся, но онтологией не считаются."""
+    return rel.startswith("docs/") or "/" not in rel
+
+
+def project_vocab(docs: dict) -> dict:
+    """vocab: из frontmatter любого ontology.md."""
+    voc = defaultdict(set)
+    for rel, d in docs.items():
+        if Path(rel).name != "ontology.md":
             continue
-        if raw.lstrip().startswith("- ") and cur_key:
-            fm.setdefault(cur_key, [])
-            if isinstance(fm[cur_key], list):
-                fm[cur_key].append(raw.lstrip()[2:].strip().strip("[]'\""))
-            continue
-        if ":" not in raw:
-            continue
-        key, _, val = raw.partition(":")
-        key, val = key.strip(), val.strip()
-        if not val:                                   # ключ вложенного блока/списка
-            cur_key = key
-            fm[key] = {} if key == "links" else []
-            continue
-        cur_key = None
-        if val.startswith("[") and val.endswith("]"):
-            fm[key] = [x.strip().strip("'\"") for x in val[1:-1].split(",") if x.strip()]
-        else:
-            fm[key] = val.strip("'\"")
-    return fm
+        v = (d["fm"] or {}).get("vocab")
+        if isinstance(v, dict):
+            for key, vals in v.items():
+                voc[key] |= {str(x) for x in as_list(vals)}
+    return voc
+
+
+def _code_path_exists(root: Path, src_rel: str, target: str) -> bool:
+    t = target.split("#")[0].strip()
+    if not t or "://" in t:
+        return True
+    base = root if t.startswith("/") else (root / src_rel).parent
+    return (base / t.lstrip("/")).exists() or (root / t.lstrip("/")).exists()
 
 
 def cmd_lint(root: Path, paths: list | None = None) -> dict:
-    """Проверка инвариантов онтологии I1–I6. Возвращает {errors, warnings, checked}."""
-    docs = list(iter_md(root))
-    known = {_nfc(p.relative_to(root).as_posix()) for p in docs}
-    # граф связей: кто на кого ссылается (для I3 — сироты)
-    out_links: dict = {}
-    in_links: dict = {}
-    issues = []  # (level, code, path, msg)
-    fm_cache = {}
+    """Проверка инвариантов онтологии I1–I8. Возвращает {issues, errors, warnings, checked}."""
+    docs = load_docs(root)
+    known = set(docs)
+    voc = project_vocab(docs)
+    node_types = NODE_TYPES | voc["node_type"]
+    statuses = STATUSES | voc["status"]
+    link_keys = LINK_KEYS | voc["link"]
+    if voc["service"]:                       # словарь задан явно — он и есть закон
+        services_vocab = set(SERVICES) | voc["service"]
+    else:                                    # иначе — из папок docs/** и кода services|apps|packages/*
+        services_vocab = set(SERVICES)
+        docs_root = root / "docs"
+        if docs_root.exists():
+            services_vocab |= {d.name for d in docs_root.rglob("*") if d.is_dir()}
+        for top in CODE_DIRS:
+            if (root / top).is_dir():
+                services_vocab |= {d.name for d in (root / top).iterdir() if d.is_dir()}
+    out_links, in_links, issues = {}, defaultdict(set), []
     sel = set(paths) if paths else None
-    # словарь сервисов выводится per-repo: sentinel + имена всех папок под docs/
-    # (сервис обычно = папка docs/services/<svc> или группирующая папка docs/<svc>)
-    docs_root = root / "docs"
-    services_vocab = set(SERVICES)
-    if docs_root.exists():
-        services_vocab |= {d.name for d in docs_root.rglob("*") if d.is_dir()}
+    edges = {}
 
-    for p in docs:
-        rel = p.relative_to(root).as_posix()
-        try:
-            text = p.read_text("utf-8", errors="replace")
-        except Exception:
-            continue
-        fm = parse_frontmatter(text)
-        fm_cache[rel] = fm
+    for rel, d in docs.items():
+        edges[rel] = doc_edges(d, known)
         outs = set()
-        for href in LINK_RE.findall(strip_code(text)):
-            tgt = resolve_link(rel, href, known)
-            if tgt:
-                outs.add(tgt)
-                in_links.setdefault(tgt, set()).add(rel)
-            elif href.split("#")[0].endswith(".md") and not href.startswith(("http", "mailto:")):
-                issues.append(("ERR", "I4", rel, f"битая ссылка → {href}"))
+        for dst, lt, kind in edges[rel]:
+            if kind == "doc":
+                outs.add(dst)
+                in_links[dst].add(rel)
         out_links[rel] = outs
+        if not in_kb(rel):
+            continue
+        for href in LINK_RE.findall(strip_code(d["body"])):
+            h = href.split()[0] if href.split() else href
+            if (h.split("#")[0].endswith(".md") and not h.startswith(("http", "mailto:"))
+                    and not resolve_link(rel, h, known) and not _code_path_exists(root, rel, h)):
+                issues.append(("ERR", "I4", rel, f"битая ссылка → {h}"))
 
     # README на каждую docs/-папку (I5)
-    docs_dirs = {p.parent for p in docs if p.relative_to(root).as_posix().startswith("docs/")}
-    for d in sorted(docs_dirs):
-        if not (d / "README.md").exists():
-            issues.append(("WARN", "I5", d.relative_to(root).as_posix() + "/", "нет README.md (индекс папки)"))
+    docs_dirs = {(root / rel).parent for rel in docs if rel.startswith("docs/")}
+    for dd in sorted(docs_dirs):
+        if not (dd / "README.md").exists() and not (dd / "index.md").exists():
+            issues.append(("WARN", "I5", dd.relative_to(root).as_posix() + "/", "нет README.md (индекс папки)"))
 
-    for p in docs:
-        rel = p.relative_to(root).as_posix()
+    for rel, d in docs.items():
         if sel and rel not in sel:
             continue
         if not rel.startswith("docs/"):
             continue
-        fm = fm_cache.get(rel)
-        nt = (fm or {}).get("node_type")
+        fm, nt = d["fm"], d["meta"]["node_type"]
         # I1 — несущий документ без frontmatter/типа
-        looks_bearing = rel.startswith(("docs/reference/", "docs/ops/", "docs/plans/",
-                                        "docs/decisions/", "docs/services/"))
+        parts = set(rel.split("/")[1:-1])
         if not fm or not nt:
-            if looks_bearing and Path(rel).name != "README.md":
+            if parts & BEARING_DIRS and Path(rel).name not in ("README.md", "index.md", "log.md"):
                 issues.append(("ERR", "I1", rel, "нет frontmatter с node_type"))
             continue
         # I2 — значения в словарях
-        if nt not in NODE_TYPES:
+        if nt not in node_types:
             issues.append(("ERR", "I2", rel, f"node_type='{nt}' вне словаря"))
-        svc = fm.get("service")
-        if svc and svc not in services_vocab:
-            issues.append(("WARN", "I2", rel, f"service='{svc}' вне словаря"))
-        st = fm.get("status")
-        if st and st not in STATUSES:
+        for svc in d["meta"]["service"]:
+            if svc not in services_vocab and not svc.startswith("_"):
+                issues.append(("WARN", "I2", rel, f"service='{svc}' вне словаря"))
+        st = d["meta"]["status"]
+        if st and st not in statuses:
             issues.append(("WARN", "I2", rel, f"status='{st}' вне словаря"))
-        # I3 — сироты (несущий тип без входящих/исходящих связей)
-        if nt in LOAD_BEARING:
-            has_link = bool(out_links.get(rel)) or bool(in_links.get(rel))
-            links_fm = fm.get("links") if isinstance(fm.get("links"), dict) else {}
-            if not has_link and not links_fm:
-                issues.append(("WARN", "I3", rel, "сирота — нет связей (ни in, ни out)"))
-        # I6 — supersedes-цель должна быть deprecated/archived
-        links_fm = fm.get("links") if isinstance(fm.get("links"), dict) else {}
-        for tgt in (links_fm.get("supersedes") or []):
-            t = resolve_link(rel, tgt, known)
-            if t:
-                tfm = fm_cache.get(t) or {}
-                if tfm.get("status") not in ("deprecated", "archived"):
-                    issues.append(("WARN", "I6", rel, f"supersedes {tgt}, но он не deprecated/archived"))
+        for lt, t in fm_links(fm):
+            if lt not in link_keys:
+                issues.append(("WARN", "I2", rel, f"тип связи '{lt}' вне словаря"))
+        # I3 — сироты (несущий тип без входящих/исходящих связей, в т.ч. на код)
+        if nt in LOAD_BEARING and not out_links.get(rel) and not in_links.get(rel) and not fm_links(fm):
+            issues.append(("WARN", "I3", rel, "сирота — нет связей (ни in, ни out)"))
+        for dst, lt, kind in edges[rel]:
+            # I6 — supersedes-цель должна быть deprecated/archived
+            if lt == "supersedes" and kind == "doc":
+                if docs[dst]["meta"]["status"] not in ("deprecated", "archived"):
+                    issues.append(("WARN", "I6", rel, f"supersedes {dst}, но он не deprecated/archived"))
+            # I4/I7 — цели типизированных связей
+            if kind == "code" and dst.endswith(".md") and not _code_path_exists(root, rel, dst):
+                issues.append(("ERR", "I4", rel, f"links.{lt} → {dst} — нет такого дока"))
+            elif kind == "code" and not _code_path_exists(root, rel, dst):
+                issues.append(("WARN", "I7", rel, f"links.{lt} → {dst} — путь не существует"))
+        # I8 — просрочен
+        if d["meta"]["stale"]:
+            issues.append(("WARN", "I8", rel, f"stale_after={fm.get('stale_after')} прошёл — перепроверь"))
 
     errs = [i for i in issues if i[0] == "ERR"]
     warns = [i for i in issues if i[0] == "WARN"]
-    return {"issues": issues, "errors": errs, "warnings": warns,
-            "checked": len(docs)}
+    return {"issues": issues, "errors": errs, "warnings": warns, "checked": len(docs)}
+
+
+# ─────────────────────────── health (скоркард) ───────────────────────────
+def cmd_health(root: Path) -> dict:
+    """Насколько БЗ — онтология, а не куча файлов. Считается по docs/** (или по всем,
+    если docs/ нет): доля с типом/title/description/updated, типизированные связи,
+    сироты, битые ссылки, trust-tier, stale, дубли по содержимому."""
+    docs = load_docs(root)
+    known = set(docs)
+    scope = {r: d for r, d in docs.items() if r.startswith("docs/")} or docs
+    content = {r: d for r, d in scope.items()
+               if Path(r).name not in ("README.md", "index.md", "log.md")}
+    n = len(content) or 1
+    typed = [d for d in content.values() if d["meta"]["node_type"]]
+    fm_of = lambda d: d["fm"] or {}
+    linked_in = defaultdict(int)
+    edges = {}
+    for r, d in docs.items():
+        edges[r] = doc_edges(d, known)
+        for dst, _, kind in edges[r]:
+            if kind == "doc":
+                linked_in[dst] += 1
+    orphans = [r for r in content if not edges[r] and not linked_in[r]]
+    broken = sum(1 for r, d in scope.items() for h in LINK_RE.findall(strip_code(d["body"]))
+                 if h.split("#")[0].endswith(".md") and not h.startswith("http")
+                 and not resolve_link(r, h.split()[0], known)
+                 and not _code_path_exists(root, r, h.split()[0]))
+    hashes = defaultdict(list)
+    for r, d in docs.items():
+        body = re.sub(r"\s+", " ", d["body"]).strip()
+        if len(body) > 200:
+            hashes[hashlib.sha1(body.encode()).hexdigest()].append(r)
+    dups = [v for v in hashes.values() if len(v) > 1]
+    trust = Counter(d["meta"]["trust"] for d in content.values())
+    pct = lambda c: round(100 * c / n)
+    res = {
+        "docs": len(content), "indexes": len(scope) - len(content), "all_md": len(docs),
+        "typed_pct": pct(len(typed)),
+        "title_pct": pct(sum(1 for d in content.values() if fm_of(d).get("title"))),
+        "description_pct": pct(sum(1 for d in content.values() if fm_of(d).get("description"))),
+        "updated_pct": pct(sum(1 for d in content.values()
+                               if fm_of(d).get("updated") or isinstance(fm_of(d).get("generated"), dict))),
+        "typed_links_pct": pct(sum(1 for d in content.values() if fm_links(d["fm"]))),
+        "code_links_pct": pct(sum(1 for r in content
+                                  if any(k == "code" for _, _, k in edges[r]))),
+        "orphans": len(orphans), "broken_links": broken,
+        "stale": sum(1 for d in content.values() if d["meta"]["stale"]),
+        "trust": dict(trust), "duplicate_groups": len(dups),
+        "duplicates": dups[:10],
+        "types": Counter(d["meta"]["node_type"] for d in typed).most_common(),
+    }
+    # интегральный балл 0–100: структура (тип/title/updated), связность, гигиена
+    score = (0.30 * res["typed_pct"] + 0.10 * res["title_pct"] + 0.10 * res["description_pct"]
+             + 0.10 * res["updated_pct"] + 0.15 * res["typed_links_pct"]
+             + 0.15 * (100 - pct(len(orphans))) + 0.10 * (100 if broken == 0 else max(0, 100 - 5 * broken)))
+    res["score"] = round(score)
+    return res
 
 
 # ─────────────────────────── map (HTML обзор + граф) ───────────────────────────
@@ -456,26 +1054,17 @@ def cmd_map(root: Path, out: Path) -> dict:
         render = lambda t: f"<pre>{_html.escape(t)}</pre>"
         pretty = False
 
+    docs = load_docs(root)
+    known = set(docs)
     files, edges = {}, []
-    raw = {}
-    for p in iter_md(root):
-        rel = p.relative_to(root).as_posix()
-        try:
-            text = p.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        raw[rel] = text
-        body = FM_RE.sub("", text, count=1)   # не рендерить YAML-frontmatter как текст
-        files[rel] = {"rel": rel, "area": area_of(rel), "title": title_of(text, rel),
-                      "size": len(text.encode("utf-8")), "html": render(body)}
-    known = set(files)
-    for rel, text in raw.items():
-        seen = set()
-        for m in LINK_RE.finditer(text):
-            dst = resolve_link(rel, m.group(1).split()[0], known)
-            if dst and dst != rel and dst not in seen:
-                seen.add(dst)
-                edges.append({"s": rel, "t": dst, "kind": "ref"})
+    for rel, d in docs.items():
+        files[rel] = {"rel": rel, "area": area_of(rel), "title": d["meta"]["title"],
+                      "size": len(d["text"].encode("utf-8")), "html": render(d["body"]),
+                      "type": d["meta"]["node_type"], "status": d["meta"]["status"]}
+    for rel, d in docs.items():
+        for dst, lt, kind in doc_edges(d, known):
+            if kind == "doc" and dst != rel:
+                edges.append({"s": rel, "t": dst, "kind": "ref", "lt": lt})
 
     areas = sorted({f["area"] for f in files.values()})
     nodes = [{"id": "area::" + a, "label": a, "kind": "area", "area": a, "size": 0} for a in areas]
@@ -560,18 +1149,39 @@ def cmd_serve(root: Path, port: int):
 
 
 # ─────────────────────────── CLI ───────────────────────────
+def _csv(v):
+    return [x.strip() for x in v.split(",") if x.strip()] if v else None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="gitmark", description="GitMark Memory Bank — md+git knowledge base CLI")
     ap.add_argument("--root", default=None, help="корень репо (по умолчанию — авто по .git)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("index", help="построить индекс").add_argument("--force", action="store_true")
-    sp = sub.add_parser("search", help="искать"); sp.add_argument("query"); sp.add_argument("-k", type=int, default=8); sp.add_argument("--json", action="store_true")
+    sub.add_parser("index", help="построить индекс").add_argument("--force", action="store_true",
+                                                                  help="(совместимость; индекс всегда пересобирается)")
+    sp = sub.add_parser("search", help="искать")
+    sp.add_argument("query"); sp.add_argument("-k", type=int, default=8); sp.add_argument("--json", action="store_true")
+    sp.add_argument("--type", help="только эти node_type/type, через запятую")
+    sp.add_argument("--status", help="только эти status, через запятую")
+    sp.add_argument("--service", help="только эти service, через запятую")
+    sp.add_argument("--scope", choices=["all", "live", "history"], default="all",
+                    help="live — без исторических plan/report; history — только они")
+    qp = sub.add_parser("query", help="структурный запрос по frontmatter",
+                        description="Условия (AND): key=val  key!=val  key~sub  key>val  key<val  key?  !key. "
+                                    "Альтернативы через |: status=draft|active. Вложенные ключи: verified.by, "
+                                    "links.depends_on. Вычисляемые: path, area, type, trust, stale.")
+    qp.add_argument("cond", nargs="*")
+    qp.add_argument("--fields", default="path,type,title,status", help="колонки вывода")
+    qp.add_argument("--count-by", help="посчитать по значениям ключа (списки разворачиваются)")
+    qp.add_argument("--json", action="store_true")
     mp = sub.add_parser("map", help="HTML обзор+граф"); mp.add_argument("-o", "--out", default=None)
     sv = sub.add_parser("serve", help="локальный http"); sv.add_argument("-p", "--port", type=int, default=8799)
     sub.add_parser("stat", help="статистика")
-    lp = sub.add_parser("lint", help="проверить онтологию (I1–I6)")
+    lp = sub.add_parser("lint", help="проверить онтологию (I1–I8)")
     lp.add_argument("paths", nargs="*", help="ограничить файлами (по умолчанию — все docs/)")
     lp.add_argument("--strict", action="store_true", help="exit 1 при любых ERR")
+    lp.add_argument("--json", action="store_true")
+    hp = sub.add_parser("health", help="скоркард БЗ"); hp.add_argument("--json", action="store_true")
     sub.add_parser("version", help="версия")
     a = ap.parse_args(argv)
     root = Path(a.root).resolve() if a.root else repo_root(Path.cwd())
@@ -581,15 +1191,31 @@ def main(argv=None):
         print(f"✓ index: {r['files']} файлов · {r['chunks']} чанков · {r['links']} ссылок · "
               f"trigram={'on' if r['trigram'] else 'OFF'} → {r['db']}")
     elif a.cmd == "search":
-        res = cmd_search(root, a.query, a.k)
+        res = cmd_search(root, a.query, a.k, _csv(a.type), _csv(a.status), _csv(a.service), a.scope)
         if a.json:
             print(json.dumps(res, ensure_ascii=False, indent=2)); return
         if not res:
             print("ничего не найдено"); return
         for r in res:
             head = f" › {r['heading']}" if r["heading"] else ""
-            print(f"\033[32m{r['path']}:{r['line']}\033[0m{head}  \033[90m[{r['via']}]\033[0m")
+            tags = " ".join(x for x in (r["node_type"], r["status"],
+                                        "stale" if r["stale"] else "",
+                                        "✓human" if r["trust"] == "human" else "") if x)
+            tags = f" \033[36m{tags}\033[0m" if tags else ""
+            print(f"\033[32m{r['path']}:{r['line']}\033[0m{head}{tags}  \033[90m[{r['via']}]\033[0m")
             print(f"   {r['snippet'][:200]}")
+    elif a.cmd == "query":
+        r = cmd_query(root, a.cond, a.count_by)
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=1, default=str)); return
+        if a.count_by:
+            for v, c in r["counts"]:
+                print(f"{c:>5}  {v}")
+        else:
+            fields = _csv(a.fields)
+            for row in r["rows"]:
+                print("  ".join(", ".join(str(x) for x in _get_path(row, f)) or "—" for f in fields))
+        print(f"\n{r['matched']} из {r['total']} документов с frontmatter")
     elif a.cmd == "map":
         out = Path(a.out) if a.out else (root / "docs" / "docs-map.html")
         r = cmd_map(root, out)
@@ -602,22 +1228,43 @@ def main(argv=None):
         s = cmd_stat(root)
         if not s.get("indexed"):
             print("индекс не построен — `gitmark index`"); return
+        types = " ".join(f"{t}:{n}" for t, n in s["types"])
         print(f"GitMark · {s['files']} файлов · {s['areas']} папок · {s['chunks']} чанков · "
-              f"{s['links']} ссылок · {s['bytes']//1024} KB · trigram={'on' if s['trigram'] else 'off'}")
+              f"{s['links']} ссылок ({s['typed_links']} типизир.) · {s['bytes']//1024} KB · "
+              f"trigram={'on' if s['trigram'] else 'off'}\n  типы: {types or '—'}")
     elif a.cmd == "lint":
         r = cmd_lint(root, a.paths or None)
-        order = {"ERR": 0, "WARN": 1}
-        codes = {}
-        for lvl, code, path, msg in sorted(r["issues"], key=lambda x: (order[x[0]], x[1], x[2])):
-            codes[code] = codes.get(code, 0) + 1
-            col = "\033[31m" if lvl == "ERR" else "\033[33m"
-            print(f"{col}{lvl}\033[0m \033[90m{code}\033[0m {path} — {msg}")
-        ne, nw = len(r["errors"]), len(r["warnings"])
-        summary = " · ".join(f"{c}×{n}" for c, n in sorted(codes.items())) or "—"
-        mark = "\033[32m✓ чисто\033[0m" if ne == 0 and nw == 0 else f"\033[31m{ne} ERR\033[0m · \033[33m{nw} WARN\033[0m"
-        print(f"\n{mark}  ({r['checked']} файлов · {summary})")
-        if a.strict and ne:
+        if a.json:
+            print(json.dumps({"errors": len(r["errors"]), "warnings": len(r["warnings"]),
+                              "checked": r["checked"],
+                              "issues": [dict(zip(("level", "code", "path", "msg"), i)) for i in r["issues"]]},
+                             ensure_ascii=False, indent=1))
+        else:
+            order = {"ERR": 0, "WARN": 1}
+            codes = {}
+            for lvl, code, path, msg in sorted(r["issues"], key=lambda x: (order[x[0]], x[1], x[2])):
+                codes[code] = codes.get(code, 0) + 1
+                col = "\033[31m" if lvl == "ERR" else "\033[33m"
+                print(f"{col}{lvl}\033[0m \033[90m{code}\033[0m {path} — {msg}")
+            ne, nw = len(r["errors"]), len(r["warnings"])
+            summary = " · ".join(f"{c}×{n}" for c, n in sorted(codes.items())) or "—"
+            mark = "\033[32m✓ чисто\033[0m" if ne == 0 and nw == 0 else f"\033[31m{ne} ERR\033[0m · \033[33m{nw} WARN\033[0m"
+            print(f"\n{mark}  ({r['checked']} файлов · {summary})")
+        if a.strict and r["errors"]:
             sys.exit(1)
+    elif a.cmd == "health":
+        h = cmd_health(root)
+        if a.json:
+            print(json.dumps(h, ensure_ascii=False, indent=1)); return
+        print(f"GitMark health · {h['score']}/100 · {h['docs']} доков (+{h['indexes']} индексов)")
+        print(f"  типизировано {h['typed_pct']}% · title {h['title_pct']}% · description {h['description_pct']}%"
+              f" · updated {h['updated_pct']}%")
+        print(f"  типизир. связи {h['typed_links_pct']}% · связь с кодом {h['code_links_pct']}%"
+              f" · сирот {h['orphans']} · битых ссылок {h['broken_links']}")
+        print(f"  trust {h['trust']} · stale {h['stale']} · дублей {h['duplicate_groups']}")
+        for g in h["duplicates"][:5]:
+            print(f"    дубль: {' = '.join(g)}")
+        print(f"  типы: {' '.join(f'{t}:{n}' for t, n in h['types']) or '—'}")
     elif a.cmd == "version":
         print(f"gitmark {VERSION}")
 

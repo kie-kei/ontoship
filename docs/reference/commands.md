@@ -3,7 +3,7 @@ node_type: reference
 title: OntoShip slash commands
 service: _platform
 status: active
-updated: 2026-06-16
+updated: 2026-10-15
 tags: [commands, slash-commands, reference]
 links:
   documents: [../../commands/kb.md, ../../commands/kb-map.md, ../../commands/doc.md, ../../commands/onto-doc.md, ../../commands/ship.md]
@@ -26,7 +26,7 @@ is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
 
 | Command | What it does | Args | Drives |
 |---|---|---|---|
-| `/kb` | Search the project KB (all `.md`) and answer from the top hits | `<query>` (empty → stat + usage) | GitMark CLI `search` / `stat` / `index` |
+| `/kb` | Search the project KB (all `.md`) and answer from the top hits; structural questions go to `query` | `<query>` (empty → stat + usage) | GitMark CLI `search` / `query` / `stat` / `index` |
 | `/kb-map` | Build a self-contained HTML map of the KB (tree + link graph) | `[output-path]` (default `docs-map.html`) | GitMark CLI `map` / `index` |
 | `/doc` | Compose or update **one** KB document per the ontology | `<topic>` | `kb-curate` skill + GitMark CLI |
 | `/onto-doc` | Build (or rebuild) the **whole** KB by fanning out curator agents | `[scope]` (empty → whole repo) | `kb-curate` skill via `Task` fan-out + GitMark CLI |
@@ -37,9 +37,11 @@ is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
 ## `/kb` — search the knowledge base
 
 - **Definition:** `commands/kb.md` · **Allowed tools:** `Bash(python3:*)`
-- **What it does:** searches every `.md` in the project (docs/, READMEs, etc.) via GitMark
-  (FTS5 bm25 ranking + trigram/fuzzy matching), then summarizes the top hits and answers
-  from the 1–2 most relevant files.
+- **What it does:** searches every `.md` git sees in the project (docs/, READMEs, etc.) via
+  GitMark (per-file ranking: section bm25 + title/description/tags + trigram/fuzzy, RRF
+  fusion; typed docs boosted, deprecated/stale demoted), then summarizes the top hits and
+  answers from the 1–2 most relevant files. Structural questions ("which decisions are
+  active", "plans per service") are answered with `gitmark.py query` over frontmatter.
 - **Args:** `$ARGUMENTS` = the search query. **Empty** → runs `gitmark.py stat` and shows
   the `/kb <query>` syntax instead of searching.
 - **Behavior:**
@@ -73,8 +75,8 @@ is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
      create a duplicate.
   2. **Pick a `node_type`** (`service` · `reference` · `runbook` · `gotcha` · `decision` ·
      `plan` · `guide` · `report` · `index`) and the right folder.
-  3. **Write frontmatter** — `node_type`, `title`, `service`, `status: active`,
-     `updated: <today>`.
+  3. **Write frontmatter** — `node_type`, `title`, `description`, `service`,
+     `status: active`, `updated: <today>`, `generated` (agent-written).
   4. **Add ≥1 typed link** (to code or a sibling doc) — no orphans.
   5. **Add a line to the folder `README.md`** index.
   6. **Lint + reindex** — `gitmark.py lint` then `gitmark.py index`.
@@ -104,6 +106,17 @@ is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
   6. **Report** — docs created/updated, coverage before→after, lint result, map path,
      areas needing a human decision.
 - **Drives:** `kb-curate` skill via `Task` fan-out + GitMark CLI. Wraps `gitmark:onto-doc`.
+
+## GitMark CLI subcommands (0.2)
+
+| Subcommand | What it does |
+|---|---|
+| `index` | rebuild `.gitmark/index.db` (chunks, frontmatter, typed links) |
+| `search "<q>" [--type --status --service]` | ranked, one result per file, with type/status/trust labels |
+| `query key=val … [--count-by key] [--fields …]` | structured questions over frontmatter, straight from md |
+| `lint [--json]` | ontology invariants I1–I8 |
+| `health [--json]` | KB scorecard: typed %, description %, typed links, orphans, trust, stale, duplicates |
+| `map` / `serve` / `stat` / `version` | HTML graph, local server, index stats, version |
 
 ## `/ship` — run the dev-flow
 

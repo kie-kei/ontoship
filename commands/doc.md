@@ -13,10 +13,13 @@ Follow the `kb-curate` skill (ontology over code):
    `plan` · `guide` · `report` · `index` (unsure → spec = `reference`, how-to = `guide`)
    and the **right folder** (service → `docs/services/<svc>/`, cross-cutting → `docs/reference/`,
    ops → `docs/ops/`, plan → `docs/plans/`, decision → `docs/decisions/`).
-3. **Write frontmatter** — `node_type`, `title`, `service`, `status: active`, `updated: <today>`.
+3. **Write frontmatter** — `node_type`, `title`, `description` (one sentence in the words of
+   someone who hasn't read the doc), `service`, `status: active`, `updated: <today>`,
+   `generated: { by: claude-code/<model>, at: <now>Z }`. Perishable facts → `stale_after`.
+   Never add a `human:` entry to `verified` yourself.
 4. **Add ≥1 typed link** — to code (`documents`/`implemented_by`) or a sibling doc
    (`depends_on`/`relates_to`). No orphans.
-5. **Add a line to the folder `README.md`** (its index): `- [Title](file.md) — hook`.
+5. **Add a line to the folder `README.md`** (its index): `- [Title](file.md) — description`.
 6. **Lint + reindex** — `python3 ${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py lint`
    then `... gitmark.py index`.
 
