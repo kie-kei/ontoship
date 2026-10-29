@@ -83,7 +83,7 @@ OntoShip ships the **`gitmark`** plugin (KB + dev-flow) as a Claude Code marketp
 |---|---|
 | `kb-search` | search the KB (FTS5) instead of grepping blind |
 | `kb-curate` | light ontology rules when adding/editing docs (types, frontmatter, typed links) |
-| `dev-flow` | the spec-driven loop to ship a feature: research → tasks → goal → **spec (md via `kb-curate`)** → isolated **git worktree** → implement → tests → independent review → dev-tests → prod-tests → ship (MR → `dev` → `main`). Feature to prod in ~40 min – 2 h. |
+| `dev-flow` | the spec-driven loop to prepare a feature: research → tasks → goal → **spec (md via `kb-curate`)** → isolated **git worktree** → implement → tests → independent review → dev-tests (local / CI) → acceptance-tests (local) → ship (diff / commits / PR). |
 
 So the agent searches the KB instead of grepping, follows light curation rules when
 editing, and ships changes through one repeatable, gated flow built around the KB.
@@ -94,7 +94,7 @@ editing, and ships changes through one repeatable, gated flow built around the K
 | `/kb-map` | build the self-contained HTML graph of the KB and open it |
 | `/doc` | compose/update **one** KB doc following the ontology (wraps `kb-curate`) |
 | `/onto-doc` | build the **whole** KB — fans out kb-curate curator agents per area, then lint + index + map |
-| `/ship` | run the dev-flow on a feature/fix: research → … → ship (MR → dev → main) |
+| `/ship` | run the dev-flow on a feature/fix: research → … → verified diff, commits or PR |
 
 ### What to write after a command (for best results)
 
@@ -124,7 +124,7 @@ the dev-flow good. Include **what** to do, **why** (the goal), and the **done-cr
 name the target service/file if you know it.
 - Good: `/ship add a 60 rpm rate-limit to /api/search; goal: stop abuse; done = HTTP 429 over the limit + a unit test + a note in docs/reference/limits.md`.
 - Weak: `/ship fix search` → the agent has to guess the goal and the done-criteria.
-- Add "deploy it" / "don't deploy" if you want to control the last step.
+- Specify whether the result should be a prepared diff, commits or a PR; the default is a prepared diff. Production access, deployment and merging are outside this flow.
 
 > **Looking for `destructive-guard`?** The `PreToolUse` safety hook that intercepts
 > destructive commands (`rm -rf`, `git reset --hard`, `terraform destroy`, `DROP TABLE`…)

@@ -3,7 +3,8 @@ node_type: reference
 title: OntoShip metrics — measuring experience transfer
 service: _platform
 status: draft
-updated: 2026-06-18
+updated: 2026-10-30
+generated: { by: codex, at: 2026-10-29T20:32:20Z }
 tags: [metrics, measurement, handoff, dev-flow]
 links:
   depends_on: [../decisions/ontoship-positioning.md]
@@ -41,7 +42,8 @@ Measure on **3 real projects** (the ones already maintained with this approach):
 
 - Onboarding time / autonomous-PR rate: track per operator per project in a simple log
   (date repo handed over, date of first independent PR, tally of author interventions).
-- Feature → PR time: read it off git/PR timestamps; the dev-flow already produces a PR.
+- For changes delivered as a PR, read Feature → PR time off git/PR timestamps. Changes
+  handed off as a local diff or commits are outside the PR-based metrics.
 - KB self-sufficiency: spot-check — did the operator ask the author something the KB
   already answers?
 

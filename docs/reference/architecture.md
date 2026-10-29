@@ -3,7 +3,8 @@ node_type: reference
 title: OntoShip architecture
 service: _platform
 status: active
-updated: 2026-06-16
+updated: 2026-10-30
+generated: { by: codex, at: 2026-10-29T20:32:20Z }
 tags: [architecture, overview, marketplace, plugin]
 links:
   documents: [../../.claude-plugin/marketplace.json, ../../.claude-plugin/plugin.json]
@@ -92,8 +93,9 @@ A user types a slash command; the command delegates to a skill; the skill calls 
   `kb-curate` curator agent per area to build the whole KB, then lints + indexes + maps.
 - **`dev-flow`** is the spec-driven loop (`/ship`): research → tasks → goal → spec (written
   as markdown via `kb-curate`) → isolated git worktree → implement → tests → independent
-  review → dev-tests → prod-tests → ship (MR → `dev` → `main`). Its specs become KB docs,
-  closing the loop back into the same markdown.
+  review → dev-tests (local / CI) → acceptance-tests (local) → ship (diff / commits / PR).
+  Production access, deployment and merging are outside this flow. Its specs become KB
+  docs, closing the loop back into the same markdown.
 - **`destructive-guard`** is orthogonal to the KB: it runs as a `PreToolUse` Bash hook on
   every command, token-parsing for destructive verbs (`rm`, `git reset --hard`,
   `docker rm -v`, SQL `DROP`/`TRUNCATE`) and forcing y/n confirmation even under

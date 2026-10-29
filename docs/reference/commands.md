@@ -3,7 +3,8 @@ node_type: reference
 title: OntoShip slash commands
 service: _platform
 status: active
-updated: 2026-10-15
+updated: 2026-10-30
+generated: { by: codex, at: 2026-10-29T20:32:20Z }
 tags: [commands, slash-commands, reference]
 links:
   documents: [../../commands/kb.md, ../../commands/kb-map.md, ../../commands/doc.md, ../../commands/onto-doc.md, ../../commands/ship.md]
@@ -17,7 +18,7 @@ command is a thin `commands/*.md` definition that drives a skill or engine. Two 
 
 - **KB curation & search** — `/kb`, `/kb-map`, `/doc`, `/onto-doc` — drive the GitMark
   CLI (`skills/kb-search/gitmark.py`) and the `kb-curate` ontology rules.
-- **Dev-flow** — `/ship` — drives the gated `dev-flow` pipeline from idea to production.
+- **Dev-flow** — `/ship` — drives the gated `dev-flow` pipeline from idea to a verified change.
 
 `${CLAUDE_PLUGIN_ROOT}` below resolves to the installed plugin directory; the GitMark CLI
 is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
@@ -30,7 +31,7 @@ is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
 | `/kb-map` | Build a self-contained HTML map of the KB (tree + link graph) | `[output-path]` (default `docs-map.html`) | GitMark CLI `map` / `index` |
 | `/doc` | Compose or update **one** KB document per the ontology | `<topic>` | `kb-curate` skill + GitMark CLI |
 | `/onto-doc` | Build (or rebuild) the **whole** KB by fanning out curator agents | `[scope]` (empty → whole repo) | `kb-curate` skill via `Task` fan-out + GitMark CLI |
-| `/ship` | Take a feature/fix from idea to production through the gated pipeline | `<change description>` | `dev-flow` skill |
+| `/ship` | Take a feature/fix from idea to a verified diff, commits or PR through the gated pipeline | `<change description>` | `dev-flow` skill |
 
 ---
 
@@ -122,8 +123,9 @@ is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
 
 - **Definition:** `commands/ship.md` · **Allowed tools:** none declared (uses default
   toolset)
-- **What it does:** drives a feature/fix from idea to production through the gated
-  OntoShip dev-flow pipeline.
+- **What it does:** drives a feature/fix from idea to a verified diff, commits or PR
+  through the gated OntoShip dev-flow pipeline. Production access, deployment and merging
+  are outside this flow.
 - **Args:** `$ARGUMENTS` = the change to ship (feature/fix description).
 - **Pipeline (per the `dev-flow` skill, end to end):**
   1. **Research** — understand from facts (logs, traces, code); reproduce before fixing.
@@ -136,9 +138,15 @@ is `${CLAUDE_PLUGIN_ROOT}/skills/kb-search/gitmark.py`.
   7. **Tests** — write/adjust unit + E2E.
   8. **Independent review** — run an independent model (e.g. Codex CLI, read-only) over
      the diff.
-  9. **Dev-tests** — MR + commits into `dev`; run the full suite. Red → fix, don't merge.
-  10. **Prod-tests** — E2E/smoke against the real prod contour.
-  11. **Ship** — merge `dev → main` and deploy (build-before-stop + healthcheck-poll).
+  9. **Dev-tests** — run the full suite locally or in CI, without requiring a `dev` branch.
+     Red → fix in the worktree and rerun. Record commands and results.
+  10. **Acceptance-tests** — check the spec's "done" criteria with E2E/smoke in a local
+      test environment. Record the setup, commands and results. Red → fix and rerun.
+  11. **Ship** — update the KB to match the implementation; hand off a prepared diff,
+      commits or PR according to the task and project conventions. Default to a prepared
+      diff if no delivery form is specified. Report changes, checks and remaining
+      limitations.
 - **Gates:** tests + independent review are not skippable; the spec is the carrier of
-  knowledge, not a throwaway ticket.
+  knowledge, not a throwaway ticket. Done = criteria met, tests and independent review
+  passed, documentation updated. Unresolved gates mean the work is incomplete.
 - **Drives:** `dev-flow` skill.

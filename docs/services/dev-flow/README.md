@@ -3,7 +3,8 @@ node_type: service
 title: dev-flow — spec-driven ship pipeline
 service: dev-flow
 status: active
-updated: 2026-06-16
+updated: 2026-10-30
+generated: { by: codex, at: 2026-10-29T20:32:20Z }
 tags: [dev-flow, pipeline, worktree, spec, ship]
 links:
   documents: [../../../skills/dev-flow/SKILL.md, ../../../commands/ship.md]
@@ -12,12 +13,13 @@ links:
 
 # dev-flow — spec-driven ship pipeline
 
-`dev-flow` is OntoShip's gated pipeline for taking a feature or fix from idea to
-production with an AI agent, fast and safely — typically **40 minutes to 2 hours** end
-to end. The defining ideas: the **spec is plain markdown written into the KB**, the work
-happens in an **isolated git worktree**, and **only green reaches prod**. The KB (the
-GitMark knowledge base, see [kb-curate](../kb-curate/README.md)) is the carrier of
-knowledge: onboarding, hand-off, and scaling all start from it, not from the code.
+`dev-flow` is OntoShip's gated pipeline for taking a feature or fix from idea to a
+verified change with an AI agent, fast and safely. The defining ideas: the **spec is
+plain markdown written into the KB**, the work happens in an **isolated git worktree**,
+and **only verified changes are ready for handoff**. The KB (the GitMark knowledge base,
+see [kb-curate](../kb-curate/README.md)) is the carrier of knowledge: onboarding,
+hand-off, and scaling all start from it, not from the code. This flow ends with a
+prepared diff, commits or PR; production access, deployment and merging are outside it.
 
 It is defined by the [`dev-flow` skill](../../../skills/dev-flow/SKILL.md) and invoked
 through the [`/ship` command](../../../commands/ship.md).
@@ -30,7 +32,7 @@ durable artifacts (tasks, a spec, a diff, test results) rather than throwaway st
 
 ```
 research → tasks → goal → spec → worktree → implement → tests
-        → independent review → dev-tests → prod-tests → ship (MR → dev → main → prod)
+        → independent review → dev-tests → acceptance-tests → ship (diff / commits / PR)
 ```
 
 ### 1. Research
@@ -71,39 +73,43 @@ feature, not an afterthought** — it is the executable form of the "done" crite
 
 ### 8. Independent review (gate)
 Run an **independent model** (e.g. Codex CLI, read-only) over the diff for logic and
-security bugs before any rollout. A second model catches what the author's model
+security bugs before handoff. A second model catches what the author's model
 misses — on a real production codebase this pass caught **191 bugs** before they reached
-prod. This is a gate because the cost of a missed logic/security bug in prod dwarfs the
-cost of the review.
+prod. This is a gate because the cost of a missed logic/security bug dwarfs the cost of
+the review.
 
 ### 9. Dev-tests (gate)
-Open an **MR with the commits into the `dev` branch** and run the **full suite** there.
-Red → fix in the worktree, **don't merge**. The gate is the branch: nothing flows to
-`main` until `dev` is green.
+Run the **full suite locally or in CI**, without requiring a dedicated `dev` branch.
+Record the commands and results. Red → fix in the worktree and rerun. The change moves
+to acceptance testing only once the suite is green.
 
-### 10. Prod-tests (gate)
-Run **E2E / smoke tests against the real prod contour** — not only mocks or dev. Verify
-behaviour where users actually live, because dev environments lie. This gate guards the
-final merge.
+### 10. Acceptance-tests (gate)
+Run **E2E / smoke tests in a local test environment** against the spec's **"done"
+criteria**. Record the setup, commands and results so the checks are reproducible.
+Red → fix in the worktree and rerun. This gate verifies the requested behaviour before
+handoff.
 
 ### 11. Ship
-Merge **`dev → main`** and deploy. Build the new image **before** stopping the old
-container, then **poll the healthcheck** to measure real downtime. This ordering
-minimizes the window where the service is unavailable.
+Update the KB to match the implementation, then hand off a **prepared diff, commits or
+PR** according to the task and project conventions. Default to a prepared diff if no
+delivery form is specified. Report the changes, checks and remaining limitations.
+
+**Done = criteria met, tests and independent review passed, documentation updated.**
+Unresolved gates mean the work is incomplete. Handoff is the final step of this flow.
 
 ## Git-flow
 
 ```
-git worktree  →  MR + commits  →  dev branch (dev-tests)  →  main (prod-tests + deploy)  →  prod
+git worktree  →  diff + review  →  dev-tests (local / CI)  →  acceptance-tests (local)  →  diff / commits / PR
 ```
 
 ## Why the gates
 
-The gates — independent review, dev-tests, prod-tests — are deliberate and
-non-negotiable. They are where bugs are caught before users see them; the 191-bug figure
+The gates — independent review, dev-tests, acceptance-tests — are deliberate and
+non-negotiable. They are where bugs are caught before handoff; the 191-bug figure
 comes specifically from the independent-review gate on a production codebase. Tests and
-review are treated as **gates, not afterthoughts**, and behaviour is **verified on prod**,
-not just dev.
+review are treated as **gates, not afterthoughts**, and behaviour is verified with
+**reproducible checks against the spec's "done" criteria**.
 
 ## How it builds on the GitMark KB
 
@@ -132,5 +138,5 @@ collapsed, but the gates stay — they are where the 191 bugs were caught.
   linkable, and graphable.
 - **Worktree isolation by default** — clean parallelism and clean rollback.
 - **Tests and independent review are gates, not afterthoughts.**
-- **Verify on prod**, not just dev.
+- **Verify with reproducible checks** against the spec's "done" criteria.
 - **md + git = source of truth**; everything derived is regenerated.
